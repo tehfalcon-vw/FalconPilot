@@ -26,16 +26,6 @@ _TRAFFIC_SINGAL_MAP = {
   66: "No overtake"
 }
 
-SteerControlType = car.CarParams.SteerControlType
-
-# These steering fault definitions seem to be common across LKA (torque) and LTA (angle):
-# - high steer rate fault: goes to 21 or 25 for 1 frame, then 9 for 2 seconds
-# - lka/lta msg drop out: goes to 9 then 11 for a combined total of 2 seconds, then 3.
-#     if using the other control command, goes directly to 3 after 1.5 seconds
-# - initializing: LTA can report 0 as long as STEER_TORQUE_SENSOR->STEER_ANGLE_INITIALIZING is 1,
-#     and is a catch-all for LKA
-TEMP_STEER_FAULTS = (0, 9, 11, 21, 25)
-
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -58,7 +48,6 @@ class CarState(CarStateBase):
     self.lkas_hud = {}
 
     #dp
-    self.frame = 0
     self.dp_sig_check = False
     self.dp_sig_sport_on_seen = True
     self.dp_sig_econ_on_seen = True
@@ -76,19 +65,6 @@ class CarState(CarStateBase):
     self.dp_zss_compute = False
     self.dp_zss_cruise_active_last = False
     self.dp_zss_angle_offset = 0.
-
-    # bsm
-    self.dp_toyota_debug_bsm = Params().get_bool('dp_toyota_debug_bsm')
-
-    self.left_blindspot = False
-    self.left_blindspot_d1 = 0
-    self.left_blindspot_d2 = 0
-    self.left_blindspot_counter = 0
-
-    self.right_blindspot = False
-    self.right_blindspot_d1 = 0
-    self.right_blindspot_d2 = 0
-    self.right_blindspot_counter = 0
 
   def update(self, cp, cp_cam):
     ret = car.CarState.new_message()
@@ -206,16 +182,12 @@ class CarState(CarStateBase):
         put_nonblocking('dp_last_modified',str(floor(time.time())))
 
     if self.CP.carFingerprint in (TSS2_CAR - RADAR_ACC_CAR):
-      # KRKeegan - Add support for toyota distance button
-      self.distance = 1 if cp_cam.vl["ACC_CONTROL"]["DISTANCE"] == 1 else 0
-      ret.distanceLines = cp.vl["PCM_CRUISE_SM"]["DISTANCE_LINES"]
+      self.distance = cp_cam.vl["ACC_CONTROL"]['DISTANCE']
+    elif self.CP.carFingerprint in [CAR.PRIUS, CAR.RAV4H, CAR.RAV4, CAR.HIGHLANDER]:
+      self.distance = cp.vl["SDSU"]['FD_BUTTON']
 
-    if self.CP.carFingerprint in RADAR_ACC_CAR:
-      # KRKeegan - Add support for toyota distance button these cars have the acc_control on car can
-      self.distance = 1 if cp.vl["ACC_CONTROL"]["DISTANCE"] == 1 else 0
-      ret.distanceLines = cp.vl["PCM_CRUISE_SM"]["DISTANCE_LINES"]
     #dp
-    ret.engineRpm = cp.vl["ENGINE_RPM"]['RPM']
+    ret.engineRPM = cp.vl["ENGINE_RPM"]['RPM']
 
     ret.leftBlinker = cp.vl["BLINKERS_STATE"]["TURN_SIGNALS"] == 1
     ret.rightBlinker = cp.vl["BLINKERS_STATE"]["TURN_SIGNALS"] == 2
@@ -224,16 +196,12 @@ class CarState(CarStateBase):
     ret.steeringTorqueEps = cp.vl["STEER_TORQUE_SENSOR"]["STEER_TORQUE_EPS"] * self.eps_torque_scale
     # we could use the override bit from dbc, but it's triggered at too high torque values
     ret.steeringPressed = abs(ret.steeringTorque) > STEER_THRESHOLD
-
-    # Check EPS LKA/LTA fault status
-    ret.steerFaultTemporary = cp.vl["EPS_STATUS"]["LKA_STATE"] in TEMP_STEER_FAULTS
-    # 3 is a fault from the lka command message not being received by the EPS (recoverable)
-    # 17 is a fault from a prolonged high torque delta between cmd and user (permanent)
+    # steer rate fault: goes to 21 or 25 for 1 frame, then 9 for 2 seconds
+    # lka msg drop out: goes to 9 then 11 for a combined total of 2 seconds
+    ret.steerFaultTemporary = cp.vl["EPS_STATUS"]["LKA_STATE"] in (0, 9, 11, 21, 25)
+    # 17 is a fault from a prolonged high torque delta between cmd and user
+    # 3 is a fault from the lka command message not being received by the EPS
     ret.steerFaultPermanent = cp.vl["EPS_STATUS"]["LKA_STATE"] in (3, 17)
-
-    if self.CP.steerControlType == SteerControlType.angle:
-      ret.steerFaultTemporary = ret.steerFaultTemporary or cp.vl["EPS_STATUS"]["LTA_STATE"] in TEMP_STEER_FAULTS
-      ret.steerFaultPermanent = ret.steerFaultPermanent or cp.vl["EPS_STATUS"]["LTA_STATE"] in (3,)
 
     if self.CP.carFingerprint in UNSUPPORTED_DSU_CAR:
       # TODO: find the bit likely in DSU_CRUISE that describes an ACC fault. one may also exist in CLUTCH
@@ -255,8 +223,7 @@ class CarState(CarStateBase):
     cp_acc = cp_cam if self.CP.carFingerprint in (TSS2_CAR - RADAR_ACC_CAR) else cp
 
     if self.CP.carFingerprint in (TSS2_CAR | RADAR_ACC_CAR):
-      if not (self.CP.flags & ToyotaFlags.SMART_DSU.value):
-        self.acc_type = cp_acc.vl["ACC_CONTROL"]["ACC_TYPE"]
+      self.acc_type = cp_acc.vl["ACC_CONTROL"]["ACC_TYPE"]
       ret.stockFcw = bool(cp_acc.vl["ACC_HUD"]["FCW"])
 
     # some TSS2 cars have low speed lockout permanently set, so ignore on those cars
@@ -284,58 +251,12 @@ class CarState(CarStateBase):
       ret.leftBlindspot = (cp.vl["BSM"]["L_ADJACENT"] == 1) or (cp.vl["BSM"]["L_APPROACHING"] == 1)
       ret.rightBlindspot = (cp.vl["BSM"]["R_ADJACENT"] == 1) or (cp.vl["BSM"]["R_APPROACHING"] == 1)
 
-    # Enable blindspot debug mode once (@arne182)
-    # let's keep all the commented out code for easy debug purpose for future.
-    if self.dp_toyota_debug_bsm and self.frame > 1999: #self.CP.carFingerprint == CAR.PRIUS_TSS2: #not (self.CP.carFingerprint in TSS2_CAR or self.CP.carFingerprint == CAR.CAMRY or self.CP.carFingerprint == CAR.CAMRYH):
-        distance_1 = cp.vl["DEBUG"].get('BLINDSPOTD1')
-        distance_2 = cp.vl["DEBUG"].get('BLINDSPOTD2')
-        side = cp.vl["DEBUG"].get('BLINDSPOTSIDE')
-
-        if distance_1 is not None and distance_2 is not None and side is not None:
-          if side == 65: # Left blind spot
-            if distance_1 != self.left_blindspot_d1:
-                self.left_blindspot_d1 = distance_1
-                self.left_blindspot_counter = 100
-            if distance_2 != self.left_blindspot_d2:
-                self.left_blindspot_d2 = distance_2
-                self.left_blindspot_counter = 100
-            if self.left_blindspot_d1 > 10 or self.left_blindspot_d2 > 10:
-                self.left_blindspot = True
-          elif side == 66: # Right blind spot
-            if distance_1 != self.right_blindspot_d1:
-                self.right_blindspot_d1 = distance_1
-                self.right_blindspot_counter = 100
-            if distance_2 != self.right_blindspot_d2:
-                self.right_blindspot_d2 = distance_2
-                self.right_blindspot_counter = 100
-            if self.right_blindspot_d1 > 10 or self.right_blindspot_d2 > 10:
-                self.right_blindspot = True
-
-          if self.left_blindspot_counter > 0:
-            self.left_blindspot_counter -= 2
-          else:
-            self.left_blindspot = False
-            self.left_blindspot_d1 = 0
-            self.left_blindspot_d2 = 0
-
-          if self.right_blindspot_counter > 0:
-            self.right_blindspot_counter -= 2
-          else:
-            self.right_blindspot = False
-            self.right_blindspot_d1 = 0
-            self.right_blindspot_d2 = 0
-
-          ret.leftBlindspot = self.left_blindspot
-          ret.rightBlindspot = self.right_blindspot
-
-
     if self.CP.carFingerprint != CAR.PRIUS_V:
       self.lkas_hud = copy.copy(cp_cam.vl["LKAS_HUD"])
 
     self._update_traffic_signals(cp_cam)
     ret.cruiseState.speedLimit = self._calculate_speed_limit()
 
-    self.frame += 1
     return ret
 
   def _init_traffic_signals(self):
@@ -457,10 +378,6 @@ class CarState(CarStateBase):
       ("DISTANCE_LINES", "PCM_CRUISE_SM"),
     ]
 
-    # Check LTA state if using LTA angle control
-    if CP.steerControlType == SteerControlType.angle:
-      signals.append(("LTA_STATE", "EPS_STATUS"))
-
     checks = [
       ("GEAR_PACKET", 1),
       ("LIGHT_STALK", 1),
@@ -485,6 +402,9 @@ class CarState(CarStateBase):
     else:
       signals.append(("GAS_PEDAL", "GAS_PEDAL"))
       checks.append(("GAS_PEDAL", 33))
+    #arne
+    if CP.carFingerprint in [CAR.PRIUS, CAR.RAV4H, CAR.RAV4, CAR.HIGHLANDER]:
+      signals.append(("FD_BUTTON", "SDSU", 0))
     #dp acceleration
     if CP.carFingerprint in (CAR.RAV4_TSS2, CAR.LEXUS_ES_TSS2, CAR.HIGHLANDER_TSS2):
       signals.append(("SPORT_ON_2", "GEAR_PACKET"))
@@ -492,10 +412,6 @@ class CarState(CarStateBase):
     if CP.carFingerprint in (CAR.ALPHARD_TSS2, CAR.ALPHARDH_TSS2, CAR.AVALON_TSS2, CAR.AVALONH_TSS2, CAR.CAMRY_TSS2, CAR.CAMRYH_TSS2, CAR.CHR_TSS2, CAR.COROLLA_TSS2, CAR.COROLLAH_TSS2, CAR.HIGHLANDER_TSS2, CAR.HIGHLANDERH_TSS2, CAR.PRIUS_TSS2, CAR.RAV4H_TSS2, CAR.MIRAI, CAR.LEXUS_ES_TSS2, CAR.LEXUS_ESH_TSS2, CAR.LEXUS_NX_TSS2, CAR.LEXUS_NXH_TSS2, CAR.LEXUS_RX_TSS2, CAR.LEXUS_RXH_TSS2, CAR.CHRH):
       signals.append(("SPORT_ON", "GEAR_PACKET"))
       signals.append(("ECON_ON", "GEAR_PACKET"))
-
-    if CP.flags & ToyotaFlags.SMART_DSU:
-      signals.append(("FD_BUTTON", "SDSU"))
-      checks.append(("SDSU", 0))
 
     if CP.carFingerprint in UNSUPPORTED_DSU_CAR:
       signals.append(("MAIN_ON", "DSU_CRUISE"))
@@ -516,9 +432,6 @@ class CarState(CarStateBase):
       signals.append(("INTERCEPTOR_GAS2", "GAS_SENSOR"))
       checks.append(("GAS_SENSOR", 50))
 
-
-    dp_toyota_debug_bsm = Params().get_bool('dp_toyota_debug_bsm')
-
     if CP.enableBsm:
       signals += [
         ("L_ADJACENT", "BSM"),
@@ -528,26 +441,13 @@ class CarState(CarStateBase):
       ]
       checks.append(("BSM", 1))
 
-    if dp_toyota_debug_bsm:
-        signals +=[
-         ("BLINDSPOT", "DEBUG"),
-         ("BLINDSPOTSIDE", "DEBUG"),
-         ("BLINDSPOTD1", "DEBUG"),
-         ("BLINDSPOTD2", "DEBUG"),
-        ]
-
     if CP.carFingerprint in RADAR_ACC_CAR:
-      if not CP.flags & ToyotaFlags.SMART_DSU.value:
-        signals += [
-          ("ACC_TYPE", "ACC_CONTROL"),
-        ]
-        checks += [
-          ("ACC_CONTROL", 33),
-        ]
       signals += [
+        ("ACC_TYPE", "ACC_CONTROL"),
         ("FCW", "ACC_HUD"),
       ]
       checks += [
+        ("ACC_CONTROL", 33),
         ("ACC_HUD", 1),
       ]
 

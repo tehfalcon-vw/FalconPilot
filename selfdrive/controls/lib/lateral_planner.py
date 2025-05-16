@@ -4,7 +4,7 @@ from common.numpy_fast import interp
 from system.swaglog import cloudlog
 from selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc
 from selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import N as LAT_MPC_N
-from selfdrive.controls.lib.drive_helpers import CONTROL_N, MIN_SPEED, get_lane_laneless_mode, get_speed_error
+from selfdrive.controls.lib.drive_helpers import CONTROL_N, MIN_SPEED, get_lane_laneless_mode
 from selfdrive.controls.lib.desire_helper import DesireHelper
 import cereal.messaging as messaging
 from cereal import log
@@ -19,20 +19,20 @@ CAMERA_OFFSET = 0.04
 PATH_COST = 1.0
 LATERAL_MOTION_COST = 0.11
 LATERAL_ACCEL_COST = 0.0
-LATERAL_JERK_COST = 0.04
+LATERAL_JERK_COST = 0.05
 # Extreme steering rate is unpleasant, even
 # when it does not cause bad jerk.
 # TODO this cost should be lowered when low
 # speed lateral control is stable on all cars
-STEERING_RATE_COST = 700.0
+STEERING_RATE_COST = 800.0
 
 
 class LateralPlanner:
-  def __init__(self, CP, debug=False):
+  def __init__(self, CP):
     self.DH = DesireHelper()
-    self.LP = LanePlanner()
 
     # dp - laneline mode
+    self.LP = LanePlanner(Params().get_bool('WideCameraOnly'))
     self.dp_lanelines_enable = False
     self.dp_lanelines_active = False
     self.dp_camera_offset = 4 if TICI else -6
@@ -45,18 +45,11 @@ class LateralPlanner:
     self.solution_invalid_cnt = 0
 
     self.path_xyz = np.zeros((TRAJECTORY_SIZE, 3))
-    self.velocity_xyz = np.zeros((TRAJECTORY_SIZE, 3))
     self.plan_yaw = np.zeros((TRAJECTORY_SIZE,))
     self.plan_yaw_rate = np.zeros((TRAJECTORY_SIZE,))
     self.t_idxs = np.arange(TRAJECTORY_SIZE)
-    self.y_pts = np.zeros((TRAJECTORY_SIZE,))
-    self.v_plan = np.zeros((TRAJECTORY_SIZE,))
-    self.v_ego = 0.0
-    self.l_lane_change_prob = 0.0
-    self.r_lane_change_prob = 0.0
+    self.y_pts = np.zeros(TRAJECTORY_SIZE)
     self.d_path_w_lines_xyz = np.zeros((TRAJECTORY_SIZE, 3))
-
-    self.debug_mode = debug
 
     self.lat_mpc = LateralMpc()
     self.reset_mpc(np.zeros(4))
@@ -67,8 +60,8 @@ class LateralPlanner:
 
   def update(self, sm):
     # clip speed , lateral planning is not possible at 0 speed
+    self.v_ego = max(MIN_SPEED, sm['carState'].vEgo)
     measured_curvature = sm['controlsState'].curvature
-    v_ego_car = sm['carState'].vEgo
     if sm.updated['dragonConf']:
       self.dp_lanelines_enable = sm['dragonConf'].dpLateralLanelines
       self.dp_camera_offset = sm['dragonConf'].dpLateralCameraOffset
@@ -85,17 +78,13 @@ class LateralPlanner:
       self.t_idxs = np.array(md.position.t)
       self.plan_yaw = np.array(md.orientation.z)
       self.plan_yaw_rate = np.array(md.orientationRate.z)
-      self.velocity_xyz = np.column_stack([md.velocity.x, md.velocity.y, md.velocity.z])
-      car_speed = np.linalg.norm(self.velocity_xyz, axis=1) - get_speed_error(md, v_ego_car)
-      self.v_plan = np.clip(car_speed, MIN_SPEED, np.inf)
-      self.v_ego = self.v_plan[0]
 
     if self.dp_lanelines_enable:
       # dp - when laneline mode enabled, we use old logic (including lane changing)
       d_path_xyz = self.lanelines_mode(md, sm['carState'], sm['carControl'].latActive, sm['dragonConf'])
     else:
       self.dp_lanelines_active = False
-    # dp -- tab spacing begin (stock logic) --
+      # dp -- tab spacing begin (stock logic) --
       # Lane change logic
       desire_state = md.meta.desireState
       if len(desire_state):
@@ -110,16 +99,16 @@ class LateralPlanner:
                              LATERAL_ACCEL_COST, LATERAL_JERK_COST,
                              STEERING_RATE_COST)
 
-    y_pts = d_path_xyz[:LAT_MPC_N+1, 1]
-    heading_pts = self.plan_yaw[:LAT_MPC_N+1]
-    yaw_rate_pts = self.plan_yaw_rate[:LAT_MPC_N+1]
+    y_pts = np.interp(self.v_ego * self.t_idxs[:LAT_MPC_N + 1], np.linalg.norm(d_path_xyz, axis=1), d_path_xyz[:, 1])
+    heading_pts = np.interp(self.v_ego * self.t_idxs[:LAT_MPC_N + 1], np.linalg.norm(self.path_xyz, axis=1), self.plan_yaw)
+    yaw_rate_pts = np.interp(self.v_ego * self.t_idxs[:LAT_MPC_N + 1], np.linalg.norm(self.path_xyz, axis=1), self.plan_yaw_rate)
     self.y_pts = y_pts
 
     assert len(y_pts) == LAT_MPC_N + 1
     assert len(heading_pts) == LAT_MPC_N + 1
     assert len(yaw_rate_pts) == LAT_MPC_N + 1
-    lateral_factor = np.clip(self.factor1 - (self.factor2 * self.v_plan**2), 0.0, np.inf)
-    p = np.column_stack([self.v_plan, lateral_factor])
+    lateral_factor = max(0, self.factor1 - (self.factor2 * self.v_ego**2))
+    p = np.array([self.v_ego, lateral_factor])
     self.lat_mpc.run(self.x0,
                      p,
                      y_pts,
@@ -141,7 +130,7 @@ class LateralPlanner:
         self.last_cloudlog_t = t
         cloudlog.warning("Lateral mpc - nan: True")
 
-    if self.lat_mpc.cost > 1e6 or mpc_nans:
+    if self.lat_mpc.cost > 20000. or mpc_nans:
       self.solution_invalid_cnt += 1
     else:
       self.solution_invalid_cnt = 0
@@ -161,11 +150,6 @@ class LateralPlanner:
 
     lateralPlan.mpcSolutionValid = bool(plan_solution_valid)
     lateralPlan.solverExecutionTime = self.lat_mpc.solve_time
-    if self.debug_mode:
-      lateralPlan.solverCost = self.lat_mpc.cost
-      lateralPlan.solverState = log.LateralPlan.SolverState.new_message()
-      lateralPlan.solverState.x = self.lat_mpc.x_sol.tolist()
-      lateralPlan.solverState.u = self.lat_mpc.u_sol.flatten().tolist()
 
     lateralPlan.desire = self.DH.desire
     lateralPlan.useLaneLines = self.dp_lanelines_active

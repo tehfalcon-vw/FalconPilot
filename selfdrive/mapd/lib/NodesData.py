@@ -2,8 +2,12 @@ import numpy as np
 from enum import Enum
 from selfdrive.mapd.lib.geo import DIRECTION, R, vectors
 
-from scipy.interpolate import splev, splprep
+from system.hardware import EON
 
+if EON:
+  from opspline import splev, splprep  # pylint: disable=E0401
+else:
+  from scipy.interpolate import splev, splprep
 
 _TURN_CURVATURE_THRESHOLD = 0.002  # 1/mts. A curvature over this value will generate a speed limit section.
 _MAX_LAT_ACC = 2.6  # Maximum lateral acceleration in turns.

@@ -1,7 +1,6 @@
 from cereal import car
 from common.numpy_fast import clip, interp
-from selfdrive.car import apply_meas_steer_torque_limits, apply_std_steer_angle_limits, \
-                          create_gas_interceptor_command, make_can_msg
+from selfdrive.car import apply_meas_steer_torque_limits, create_gas_interceptor_command, make_can_msg
 from selfdrive.car.toyota.toyotacan import create_steer_command, create_ui_command, \
                                            create_accel_command, create_acc_cancel_command, \
                                            create_fcw_command, create_lta_steer_command
@@ -12,10 +11,8 @@ from opendbc.can.packer import CANPacker
 from common.conversions import Conversions as CV
 from common.params import Params
 
-SteerControlType = car.CarParams.SteerControlType
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 
-# LKA limits
 # EPS faults if you apply torque while the steering rate is above 100 deg/s for too long
 MAX_STEER_RATE = 100  # deg/s
 MAX_STEER_RATE_FRAMES = 18  # tx control frames needed before torque can be cut
@@ -23,38 +20,17 @@ MAX_STEER_RATE_FRAMES = 18  # tx control frames needed before torque can be cut
 # EPS allows user torque above threshold for 50 frames before permanently faulting
 MAX_USER_TORQUE = 500
 
-# LTA limits
-# EPS ignores commands above this angle and causes PCS to fault
-MAX_STEER_ANGLE = 94.9461  # deg
-
 GearShifter = car.CarState.GearShifter
 UNLOCK_CMD = b'\x40\x05\x30\x11\x00\x40\x00\x00'
 LOCK_CMD = b'\x40\x05\x30\x11\x00\x80\x00\x00'
 LOCK_AT_SPEED = 10 * CV.KPH_TO_MS
 
-# Blindspot codes
-LEFT_BLINDSPOT = b'\x41'
-RIGHT_BLINDSPOT = b'\x42'
-
-def set_blindspot_debug_mode(lr,enable):
-  if enable:
-    m = lr + b'\x02\x10\x60\x00\x00\x00\x00'
-  else:
-    m = lr + b'\x02\x10\x01\x00\x00\x00\x00'
-  return make_can_msg(0x750, m, 0)
-
-
-def poll_blindspot_status(lr):
-  m = lr + b'\x02\x21\x69\x00\x00\x00\x00'
-  return make_can_msg(0x750, m, 0)
-
 class CarController:
   def __init__(self, dbc_name, CP, VM):
     self.CP = CP
-    self.params = CarControllerParams(self.CP)
+    self.torque_rate_limits = CarControllerParams(self.CP)
     self.frame = 0
     self.last_steer = 0
-    self.last_angle = 0
     self.alert_active = False
     self.last_standstill = False
     self.standstill_req = False
@@ -75,25 +51,15 @@ class CarController:
     self.lock_once = False
     self.lat_controller_type = None
     self.lat_controller_type_prev = None
-    self.blindspot_debug_enabled_left = False
-    self.blindspot_debug_enabled_right = False
-    self.blindspot_frame = 0
-    if self.CP.carFingerprint in TSS2_CAR: # tss2 can do higher hz then tss1 and can be on at all speed/standstill
-        self.blindspot_rate = 2
-        self.blindspot_always_on = True
-    else:
-        self.blindspot_rate = 20
-        self.blindspot_always_on = False
 
   def update(self, CC, CS, now_nanos, dragonconf):
     if dragonconf is not None:
       self.dp_toyota_sng = dragonconf.dpToyotaSng
       self.dp_toyota_auto_lock = dragonconf.dpToyotaAutoLock
       self.dp_toyota_auto_unlock = dragonconf.dpToyotaAutoUnlock
-      self.dp_toyota_debug_bsm = dragonconf.dpToyotaDebugBsm
     self.lat_controller_type = CC.latController
     if self.lat_controller_type != self.lat_controller_type_prev:
-      self.params.update(CC.latController)
+      self.torque_rate_limits.update(CC.latController)
     self.lat_controller_type_prev = self.lat_controller_type
 
     self.dp_toyota_change5speed = Params().get_bool("dp_toyota_change5speed")
@@ -102,55 +68,7 @@ class CarController:
     pcm_cancel_cmd = CC.cruiseControl.cancel
     lat_active = CC.latActive and abs(CS.out.steeringTorque) < MAX_USER_TORQUE
 
-    # *** control msgs ***
-    can_sends = []
-
-    # *** steer torque ***
-    new_steer = int(round(actuators.steer * self.params.STEER_MAX))
-    apply_steer = apply_meas_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, self.params)
-
-    # Count up to MAX_STEER_RATE_FRAMES, at which point we need to cut torque to avoid a steering fault
-    if lat_active and abs(CS.out.steeringRateDeg) >= MAX_STEER_RATE:
-      self.steer_rate_counter += 1
-    else:
-      self.steer_rate_counter = 0
-
-    apply_steer_req = 1
-    if not lat_active:
-      apply_steer = 0
-      apply_steer_req = 0
-    elif self.steer_rate_counter > MAX_STEER_RATE_FRAMES:
-      apply_steer_req = 0
-      self.steer_rate_counter = 0
-
-    # *** steer angle ***
-    if self.CP.steerControlType == SteerControlType.angle:
-      # If using LTA control, disable LKA and set steering angle command
-      apply_steer = 0
-      apply_steer_req = 0
-      if self.frame % 2 == 0:
-        # EPS uses the torque sensor angle to control with, offset to compensate
-        apply_angle = actuators.steeringAngleDeg + CS.out.steeringAngleOffsetDeg
-
-        # Angular rate limit based on speed
-        apply_angle = apply_std_steer_angle_limits(apply_angle, self.last_angle, CS.out.vEgo, self.params)
-
-        if not CC.latActive:
-          apply_angle = CS.out.steeringAngleDeg + CS.out.steeringAngleOffsetDeg
-
-        self.last_angle = clip(apply_angle, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
-
-    self.last_steer = apply_steer
-
-    # toyota can trace shows this message at 42Hz, with counter adding alternatively 1 and 2;
-    # sending it at 100Hz seem to allow a higher rate limit, as the rate limit seems imposed
-    # on consecutive messages
-    can_sends.append(create_steer_command(self.packer, apply_steer, apply_steer_req))
-    if self.frame % 2 == 0 and self.CP.carFingerprint in TSS2_CAR:
-      lta_active = CC.latActive and self.CP.steerControlType == SteerControlType.angle
-      can_sends.append(create_lta_steer_command(self.packer, self.last_angle, lta_active, self.frame // 2))
-
-    # *** gas and brake ***
+    # gas and brake
     if self.CP.enableGasInterceptor and CC.longActive:
       MAX_INTERCEPTOR_GAS = 0.5
       # RAV4 has very sensitive gas pedal
@@ -166,7 +84,30 @@ class CarController:
       interceptor_gas_cmd = clip(pedal_command, 0., MAX_INTERCEPTOR_GAS)
     else:
       interceptor_gas_cmd = 0.
-    pcm_accel_cmd = clip(actuators.accel, self.params.ACCEL_MIN, self.params.ACCEL_MAX)
+    pcm_accel_cmd = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+
+    # steer torque
+    new_steer = int(round(actuators.steer * CarControllerParams.STEER_MAX))
+    apply_steer = apply_meas_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, self.torque_rate_limits)
+
+    # Count up to MAX_STEER_RATE_FRAMES, at which point we need to cut torque to avoid a steering fault
+    if lat_active and abs(CS.out.steeringRateDeg) >= MAX_STEER_RATE:
+      self.steer_rate_counter += 1
+    else:
+      self.steer_rate_counter = 0
+
+    apply_steer_req = 1
+    if not lat_active:
+      apply_steer = 0
+      apply_steer_req = 0
+    elif self.steer_rate_counter > MAX_STEER_RATE_FRAMES:
+      apply_steer_req = 0
+      self.steer_rate_counter = 0
+
+    # Never actuate with LKA on cars that only support LTA
+    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+      apply_steer = 0
+      apply_steer_req = 0
 
     # TODO: probably can delete this. CS.pcm_acc_status uses a different signal
     # than CS.cruiseState.enabled. confirm they're not meaningfully different
@@ -181,7 +122,10 @@ class CarController:
       self.standstill_req = False
     self.standstill_req = False if self.dp_toyota_sng else self.standstill_req
 
+    self.last_steer = apply_steer
     self.last_standstill = CS.out.standstill
+
+    can_sends = []
 
     # dp - door auto lock / unlock logic
     # thanks to AlexandreSato & cydia2020
@@ -198,44 +142,20 @@ class CarController:
         self.lock_once = True
       self.last_gear = gear
 
-    # Enable blindspot debug mode once (@arne182)
-    # let's keep all the commented out code for easy debug purpose for future.
-    if self.dp_toyota_debug_bsm:
-      if self.frame > 2000:
-        #left bsm
-        if not self.blindspot_debug_enabled_left:
-            if (self.blindspot_always_on or (CS.out.leftBlinker and CS.out.vEgo > 6)): # eagle eye camera will stop working if right bsm is switched on under 6m/s
-                can_sends.append(set_blindspot_debug_mode(LEFT_BLINDSPOT, True))
-                self.blindspot_debug_enabled_left = True
-                # print("bsm debug left, on")
-        else:
-            if not self.blindspot_always_on and not CS.out.leftBlinker and self.frame - self.blindspot_frame > 500:
-                can_sends.append(set_blindspot_debug_mode(LEFT_BLINDSPOT, False))
-                self.blindspot_debug_enabled_left = False
-                # print("bsm debug left, off")
-            if self.frame % self.blindspot_rate == 0:
-                can_sends.append(poll_blindspot_status(LEFT_BLINDSPOT))
-                if CS.out.leftBlinker:
-                    self.blindspot_frame = self.frame
-                    # print(self.blindspot_frame)
-                # print("bsm poll left")
-        #right bsm
-        if not self.blindspot_debug_enabled_right:
-            if (self.blindspot_always_on or (CS.out.rightBlinker and CS.out.vEgo > 6)): # eagle eye camera will stop working if right bsm is switched on under 6m/s
-                can_sends.append(set_blindspot_debug_mode(RIGHT_BLINDSPOT, True))
-                self.blindspot_debug_enabled_right = True
-                # print("bsm debug right, on")
-        else:
-            if not self.blindspot_always_on and not CS.out.rightBlinker and self.frame - self.blindspot_frame > 500:
-                can_sends.append(set_blindspot_debug_mode(RIGHT_BLINDSPOT, False))
-                self.blindspot_debug_enabled_right = False
-                # print("bsm debug right, off")
-            if self.frame % self.blindspot_rate == self.blindspot_rate/2:
-                can_sends.append(poll_blindspot_status(RIGHT_BLINDSPOT))
-                if CS.out.rightBlinker:
-                    self.blindspot_frame = self.frame
-                    # print(self.blindspot_frame)
-                # print("bsm poll right")
+    # *** control msgs ***
+    # print("steer {0} {1} {2} {3}".format(apply_steer, min_lim, max_lim, CS.steer_torque_motor)
+
+    # toyota can trace shows this message at 42Hz, with counter adding alternatively 1 and 2;
+    # sending it at 100Hz seem to allow a higher rate limit, as the rate limit seems imposed
+    # on consecutive messages
+    can_sends.append(create_steer_command(self.packer, apply_steer, apply_steer_req))
+    if self.frame % 2 == 0 and self.CP.carFingerprint in TSS2_CAR:
+      can_sends.append(create_lta_steer_command(self.packer, 0, 0, self.frame // 2))
+
+    # LTA mode. Set ret.steerControlType = car.CarParams.SteerControlType.angle and whitelist 0x191 in the panda
+    # if self.frame % 2 == 0:
+    #   can_sends.append(create_steer_command(self.packer, 0, 0, self.frame // 2))
+    #   can_sends.append(create_lta_steer_command(self.packer, actuators.steeringAngleDeg, apply_steer_req, self.frame // 2))
 
     # we can spam can to cancel the system even if we are using lat only control
     if (self.frame % 3 == 0 and self.CP.openpilotLongitudinalControl) or pcm_cancel_cmd:
@@ -256,7 +176,6 @@ class CarController:
       can_sends.append(create_gas_interceptor_command(self.packer, interceptor_gas_cmd, self.frame // 2))
       self.gas = interceptor_gas_cmd
 
-    # *** hud ui ***
     if self.CP.carFingerprint != CAR.PRIUS_V:
       # ui mesg is at 1Hz but we send asap if:
       # - there is something to display
@@ -287,9 +206,8 @@ class CarController:
         can_sends.append(make_can_msg(addr, vl, bus))
 
     new_actuators = actuators.copy()
-    new_actuators.steer = apply_steer / self.params.STEER_MAX
+    new_actuators.steer = apply_steer / CarControllerParams.STEER_MAX
     new_actuators.steerOutputCan = apply_steer
-    new_actuators.steeringAngleDeg = self.last_angle
     new_actuators.accel = self.accel
     new_actuators.gas = self.gas
 

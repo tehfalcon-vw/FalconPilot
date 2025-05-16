@@ -9,7 +9,6 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import BinaryIO, Iterator, List, Optional, Tuple, Union
 
 from cereal import log
 import cereal.messaging as messaging
@@ -32,23 +31,10 @@ force_wifi = os.getenv("FORCEWIFI") is not None
 fake_upload = os.getenv("FAKEUPLOAD") is not None
 
 
-class FakeRequest:
-  def __init__(self):
-    self.headers = {"Content-Length": "0"}
-
-
-class FakeResponse:
-  def __init__(self):
-    self.status_code = 200
-    self.request = FakeRequest()
-
-
-UploadResponse = Union[requests.Response, FakeResponse]
-
-def get_directory_sort(d: str) -> List[str]:
+def get_directory_sort(d):
   return list(map(lambda s: s.rjust(10, '0'), d.rsplit('--', 1)))
 
-def listdir_by_creation(d: str) -> List[str]:
+def listdir_by_creation(d):
   try:
     paths = os.listdir(d)
     paths = sorted(paths, key=get_directory_sort)
@@ -57,7 +43,7 @@ def listdir_by_creation(d: str) -> List[str]:
     cloudlog.exception("listdir_by_creation failed")
     return list()
 
-def clear_locks(root: str) -> None:
+def clear_locks(root):
   for logname in os.listdir(root):
     path = os.path.join(root, logname)
     try:
@@ -68,14 +54,16 @@ def clear_locks(root: str) -> None:
       cloudlog.exception("clear_locks failed")
 
 
-class Uploader:
-  def __init__(self, dongle_id: str, root: str):
+class Uploader():
+  def __init__(self, dongle_id, root):
     self.dongle_id = dongle_id
     self.api = Api(dongle_id)
     self.root = root
 
-    self.last_resp: Optional[UploadResponse] = None
-    self.last_exc: Optional[Tuple[Exception, str]] = None
+    self.upload_thread = None
+
+    self.last_resp = None
+    self.last_exc = None
 
     self.immediate_size = 0
     self.immediate_count = 0
@@ -91,12 +79,12 @@ class Uploader:
     # dp
     self.update_onced = False
 
-  def get_upload_sort(self, name: str) -> int:
+  def get_upload_sort(self, name):
     if name in self.immediate_priority:
       return self.immediate_priority[name]
     return 1000
 
-  def list_upload_files(self) -> Iterator[Tuple[str, str, str]]:
+  def list_upload_files(self):
     if not os.path.isdir(self.root):
       return
 
@@ -118,7 +106,7 @@ class Uploader:
         fn = os.path.join(path, name)
         # skip files already uploaded
         try:
-          is_uploaded = getxattr(fn, UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE
+          is_uploaded = getxattr(fn, UPLOAD_ATTR_NAME)
         except OSError:
           cloudlog.event("uploader_getxattr_failed", exc=self.last_exc, key=key, fn=fn)
           is_uploaded = True  # deleter could have deleted
@@ -132,22 +120,22 @@ class Uploader:
         except OSError:
           pass
 
-        yield name, key, fn
+        yield (name, key, fn)
 
-  def next_file_to_upload(self) -> Optional[Tuple[str, str, str]]:
+  def next_file_to_upload(self):
     upload_files = list(self.list_upload_files())
 
     for name, key, fn in upload_files:
       if any(f in fn for f in self.immediate_folders):
-        return name, key, fn
+        return (name, key, fn)
 
     for name, key, fn in upload_files:
       if name in self.immediate_priority:
-        return name, key, fn
+        return (name, key, fn)
 
     return None
 
-  def do_upload(self, key: str, fn: str) -> None:
+  def do_upload(self, key, fn):
     try:
       url_resp = self.api.get("v1.4/" + self.dongle_id + "/upload_url/", timeout=10, path=key, access_token=self.api.get_token())
       if url_resp.status_code == 412:
@@ -161,13 +149,17 @@ class Uploader:
 
       if fake_upload:
         cloudlog.debug(f"*** WARNING, THIS IS A FAKE UPLOAD TO {url} ***")
+
+        class FakeResponse():
+          def __init__(self):
+            self.status_code = 200
+
         self.last_resp = FakeResponse()
       else:
         with open(fn, "rb") as f:
-          data: BinaryIO
           if key.endswith('.bz2') and not fn.endswith('.bz2'):
-            compressed = bz2.compress(f.read())
-            data = io.BytesIO(compressed)
+            data = bz2.compress(f.read())
+            data = io.BytesIO(data)
           else:
             data = f
 
@@ -176,7 +168,7 @@ class Uploader:
       self.last_exc = (e, traceback.format_exc())
       raise
 
-  def normal_upload(self, key: str, fn: str) -> Optional[UploadResponse]:
+  def normal_upload(self, key, fn):
     self.last_resp = None
     self.last_exc = None
 
@@ -187,7 +179,7 @@ class Uploader:
 
     return self.last_resp
 
-  def upload(self, name: str, key: str, fn: str, network_type: int, metered: bool) -> bool:
+  def upload(self, name, key, fn, network_type, metered):
     try:
       sz = os.path.getsize(fn)
     except OSError:
@@ -208,13 +200,7 @@ class Uploader:
       if stat is not None and stat.status_code in (200, 201, 401, 403, 412):
         self.last_filename = fn
         self.last_time = time.monotonic() - start_time
-        if stat.status_code == 412:
-          self.last_speed = 0
-          cloudlog.event("upload_ignored", key=key, fn=fn, sz=sz, network_type=network_type, metered=metered)
-        else:
-          content_length = int(stat.request.headers.get("Content-Length", 0))
-          self.last_speed = (content_length / 1e6) / self.last_time
-          cloudlog.event("upload_success", key=key, fn=fn, sz=sz, content_length=content_length, network_type=network_type, metered=metered, speed=self.last_speed)
+        self.last_speed = (sz / 1e6) / self.last_time
         success = True
         if not self.update_onced and stat.status_code != 412:
           Params().put_bool('dp_upload_ignored', False)
@@ -244,7 +230,7 @@ class Uploader:
     return msg
 
 
-def uploader_fn(exit_event: threading.Event) -> None:
+def uploader_fn(exit_event):
   try:
     set_core_affinity([0, 1, 2, 3])
   except Exception:
@@ -299,7 +285,7 @@ def uploader_fn(exit_event: threading.Event) -> None:
     pm.send("uploaderState", uploader.get_msg())
 
 
-def main() -> None:
+def main():
   uploader_fn(threading.Event())
 
 

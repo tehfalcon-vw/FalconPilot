@@ -84,7 +84,6 @@ interfaces = load_interfaces(interface_names)
 def fingerprint(logcan, sendcan, num_pandas):
   fixed_fingerprint = os.environ.get('FINGERPRINT', "")
   skip_fw_query = os.environ.get('SKIP_FW_QUERY', False)
-  disable_fw_cache = os.environ.get('DISABLE_FW_CACHE', False)
   ecu_rx_addrs = set()
   params = Params()
 
@@ -103,8 +102,7 @@ def fingerprint(logcan, sendcan, num_pandas):
       if cached_params.carName == "mock":
         cached_params = None
 
-    if cached_params is not None and len(cached_params.carFw) > 0 and \
-       cached_params.carVin is not VIN_UNKNOWN and not disable_fw_cache:
+    if cached_params is not None and len(cached_params.carFw) > 0 and cached_params.carVin is not VIN_UNKNOWN:
       cloudlog.warning("Using cached CarParams")
       vin, vin_rx_addr = cached_params.carVin, 0
       car_fw = list(cached_params.carFw)
@@ -241,7 +239,7 @@ def get_car(logcan, sendcan, experimental_long_allowed, num_pandas=1):
 
   try:
     CarInterface, CarController, CarState = interfaces[candidate]
-    CP = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long_allowed, docs=False)
+    CP = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long_allowed)
     CP.carVin = vin
     CP.carFw = car_fw
     CP.fingerprintSource = source

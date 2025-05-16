@@ -198,7 +198,7 @@ class StartupAlert(Alert):
   def __init__(self, alert_text_1: str, alert_text_2: str = _("Always keep hands on wheel and eyes on road"), alert_status=AlertStatus.normal):
     super().__init__(alert_text_1, alert_text_2,
                      alert_status, AlertSize.mid,
-                     Priority.LOWER, VisualAlert.none, AudibleAlert.none, 5.),
+                     Priority.LOWER, VisualAlert.none, AudibleAlert.none, 10.),
 
 
 # ********** helper functions **********
@@ -247,10 +247,9 @@ def below_steer_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
 
 
 def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
-  first_word = _('Recalibration') if sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.recalibrating else _('Calibration')
   return Alert(
-    f"{first_word} in Progress: {sm['liveCalibration'].calPerc:.0f}%",
-    f"Drive Above {get_display_speed(MIN_SPEED_FILTER, metric)}",
+    _("Calibration in Progress: %d%%") % sm['liveCalibration'].calPerc,
+    _("Drive Above %s") % get_display_speed(MIN_SPEED_FILTER, metric),
     AlertStatus.normal, AlertSize.mid,
     Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2)
 
@@ -289,7 +288,7 @@ def comm_issue_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaste
 
 
 def camera_malfunction_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
-  all_cams = ('roadCameraState', 'driverCameraState', 'wideRoadCameraState')
+  all_cams = ('roadCameraState')
   bad_cams = [s.replace('State', '') for s in all_cams if s in sm.data.keys() and not sm.all_checks([s, ])]
   return NormalPermanentAlert(_("Camera Malfunction"), ', '.join(bad_cams))
 
@@ -373,7 +372,6 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # Car is recognized, but marked as dashcam only
   EventName.startupNoControl: {
     ET.PERMANENT: StartupAlert(_("Dashcam mode")),
-    ET.NO_ENTRY: NoEntryAlert(_("Dashcam mode")),
   },
 
   # Car is not recognized
@@ -686,11 +684,6 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("Steering Temporarily Unavailable")),
   },
 
-  EventName.steerTimeLimit: {
-    ET.SOFT_DISABLE: soft_disable_alert("Vehicle Steering Time Limit"),
-    ET.NO_ENTRY: NoEntryAlert("Vehicle Steering Time Limit"),
-  },
-
   EventName.outOfSpace: {
     ET.PERMANENT: out_of_space_alert,
     ET.NO_ENTRY: NoEntryAlert(_("Out of Storage")),
@@ -747,14 +740,8 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   EventName.calibrationIncomplete: {
     ET.PERMANENT: calibration_incomplete_alert,
-    ET.SOFT_DISABLE: soft_disable_alert("Calibration Incomplete"),
-    ET.NO_ENTRY: NoEntryAlert("Calibration in Progress"),
-  },
-
-  EventName.calibrationRecalibrating: {
-    ET.PERMANENT: calibration_incomplete_alert,
-    ET.SOFT_DISABLE: soft_disable_alert("Device Remount Detected: Recalibrating"),
-    ET.NO_ENTRY: NoEntryAlert("Remount Detected: Recalibrating"),
+    ET.SOFT_DISABLE: soft_disable_alert(_("Calibration in Progress")),
+    ET.NO_ENTRY: NoEntryAlert(_("Calibration in Progress")),
   },
 
   EventName.doorOpen: {
@@ -850,6 +837,10 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("Cruise Fault: Restart the Car")),
   },
 
+  EventName.accFaultedTemp: {
+    ET.NO_ENTRY: NoEntryAlert("Cruise Temporarily Faulted"),
+  },
+
   EventName.controlsMismatch: {
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Controls Mismatch")),
     ET.NO_ENTRY: NoEntryAlert(_("Controls Mismatch")),
@@ -911,13 +902,19 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("LKAS Fault: Restart the Car")),
   },
 
+  EventName.brakeUnavailable: {
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Cruise Fault: Restart the Car")),
+    ET.PERMANENT: NormalPermanentAlert(_("Cruise Fault: Restart the car to engage")),
+    ET.NO_ENTRY: NoEntryAlert(_("Cruise Fault: Restart the Car")),
+  },
+
   EventName.reverseGear: {
     ET.PERMANENT: Alert(
       _("Reverse\nGear"),
       "",
-      AlertStatus.normal, AlertSize.none,
+      AlertStatus.normal, AlertSize.full,
       Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
-    # ET.USER_DISABLE: ImmediateDisableAlert(_("Reverse Gear")),
+    ET.USER_DISABLE: ImmediateDisableAlert(_("Reverse Gear")),
     ET.NO_ENTRY: NoEntryAlert(_("Reverse Gear")),
   },
 
@@ -973,10 +970,14 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("LKAS Disabled")),
   },
 
-  EventName.vehicleSensorsInvalid: {
-    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Vehicle Sensors Invalid")),
-    ET.PERMANENT: NormalPermanentAlert(_("Vehicle Sensors Calibrating"), _("Drive to Calibrate")),
-    ET.NO_ENTRY: NoEntryAlert(_("Vehicle Sensors Calibrating"), _("Drive to Calibrate")),
+  # dp - use for atl alert
+  EventName.communityFeatureDisallowedDEPRECATED: {
+    ET.OVERRIDE_LATERAL: Alert(
+      "",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.MID, VisualAlert.none,
+      AudibleAlert.disengage, .2),
   },
 
   # dp - use for manual lane change

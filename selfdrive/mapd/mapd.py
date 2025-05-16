@@ -4,11 +4,11 @@ from traceback import print_exception
 import numpy as np
 from time import strftime, gmtime
 import cereal.messaging as messaging
-from common.realtime import Ratekeeper, sec_since_boot, config_realtime_process
+from common.realtime import Ratekeeper, sec_since_boot
 from selfdrive.mapd.lib.osm import OSM
 from selfdrive.mapd.lib.geo import distance_to_points
 from selfdrive.mapd.lib.WayCollection import WayCollection
-from selfdrive.mapd.config import QUERY_RADIUS, MIN_DISTANCE_FOR_NEW_QUERY, FULL_STOP_MAX_SPEED, LOOK_AHEAD_HORIZON_TIME, QUERY_RADIUS_OFFLINE
+from selfdrive.mapd.config import QUERY_RADIUS, MIN_DISTANCE_FOR_NEW_QUERY, FULL_STOP_MAX_SPEED, LOOK_AHEAD_HORIZON_TIME
 from system.swaglog import cloudlog
 
 # dp
@@ -39,7 +39,6 @@ threading.excepthook = excepthook
 class MapD():
   def __init__(self):
     self.osm = OSM()
-    self.is_offline = self.osm.is_offline()
     self.way_collection = None
     self.route = None
     self.last_gps_fix_timestamp = 0
@@ -115,7 +114,7 @@ class MapD():
       # Only issue an update if we received some ways. Otherwise it is most likely a conectivity issue.
       # Will retry on next loop.
       if len(ways) > 0:
-        new_way_collection = WayCollection(areas, ways, location_rad, osm.is_offline())
+        new_way_collection = WayCollection(areas, ways, location_rad)
 
         # Use the lock to update the way_collection as it might be being used to update the route.
         _debug('Mapd: Locking to write results from osm.', log_to_cloud=False)
@@ -131,7 +130,7 @@ class MapD():
       return
 
     self._query_thread = threading.Thread(target=query, args=(self.osm, self.location_deg, self.location_rad,
-                                                              QUERY_RADIUS if self.is_offline else QUERY_RADIUS_OFFLINE))
+                                                              QUERY_RADIUS))
     self._query_thread.start()
 
   def updated_osm_data(self):
@@ -146,7 +145,7 @@ class MapD():
 
     if self.last_fetch_location is not None:
       distance_since_last = distance_to_points(self.last_fetch_location, np.array([self.location_rad]))[0]
-      if distance_since_last < ((QUERY_RADIUS if self.is_offline else QUERY_RADIUS_OFFLINE) - MIN_DISTANCE_FOR_NEW_QUERY):
+      if distance_since_last < QUERY_RADIUS - MIN_DISTANCE_FOR_NEW_QUERY:
         # do not query if are still not close to the border of previous query area
         return
 
@@ -271,7 +270,6 @@ class MapD():
 
 # provides live map data information
 def mapd_thread(sm=None, pm=None):
-  config_realtime_process([2], 5)
   mapd = MapD()
   rk = Ratekeeper(1., print_delay_threshold=None)  # Keeps rate at 1 hz
 

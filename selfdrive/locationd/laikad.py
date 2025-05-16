@@ -5,6 +5,7 @@ import time
 import shutil
 from collections import defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
+from datetime import datetime
 from enum import IntEnum
 from typing import List, Optional, Dict, Any
 
@@ -87,6 +88,7 @@ class Laikad:
     self.auto_fetch_navs = auto_fetch_navs
     self.orbit_fetch_executor: Optional[ProcessPoolExecutor] = None
     self.orbit_fetch_future: Optional[Future] = None
+    self.got_first_gnss_msg = False
 
     self.last_report_time = GPSTime(0, 0)
     self.last_fetch_navs_t = GPSTime(0, 0)
@@ -130,27 +132,26 @@ class Laikad:
 
     if self.save_ephemeris and (self.last_report_time - self.last_cached_t > SECS_IN_MIN):
       nav_list: List = sum([v for k,v in self.astro_dog.navs.items()], [])
-      #TODO this only saves currently valid ephems, when we download future ephems we should save them too
-      valid_navs = [e for e in nav_list if e.valid(self.last_report_time)]
-      if len(valid_navs) > 0:
-        ephem_cache = ephemeris_structs.EphemerisCache(**{'glonassEphemerides': [e.data for e in valid_navs if e.prn[0]=='R'],
-                                                          'gpsEphemerides': [e.data for e in valid_navs if e.prn[0]=='G']})
-        put_nonblocking(EPHEMERIS_CACHE, ephem_cache.to_bytes())
-        cloudlog.debug("Cache saved")
+      ephem_cache = ephemeris_structs.EphemerisCache(**{'glonassEphemerides': [e.data for e in nav_list if e.prn[0]=='R'],
+                                                        'gpsEphemerides': [e.data for e in nav_list if e.prn[0]=='G']})
+
+      put_nonblocking(EPHEMERIS_CACHE, ephem_cache.to_bytes())
+      cloudlog.debug("Cache saved")
       self.last_cached_t = self.last_report_time
 
   def create_ephem_statuses(self):
     ephemeris_statuses = []
-    eph_list: List = sum([v for k,v in self.astro_dog.navs.items()], []) + sum([v for k,v in self.astro_dog.qcom_polys.items()], [])
-    for eph in eph_list:
-      status = log.GnssMeasurements.EphemerisStatus.new_message()
-      status.constellationId = ConstellationId.from_rinex_char(eph.prn[0]).value
-      status.svId = get_sv_id(eph.prn)
-      status.type = get_log_eph_type(eph).value
-      status.source = get_log_eph_source(eph).value
-      status.tow = eph.epoch.tow
-      status.gpsWeek = eph.epoch.week
-      ephemeris_statuses.append(status)
+    prns_to_check = list(self.astro_dog.get_all_ephem_prns())
+    prns_to_check.sort()
+    for prn in prns_to_check:
+      eph = self.astro_dog.get_eph(prn, self.last_report_time)
+      if eph is not None:
+        status = log.GnssMeasurements.EphemerisStatus.new_message()
+        status.constellationId = ConstellationId.from_rinex_char(prn[0]).value
+        status.svId = get_sv_id(prn)
+        status.type = get_log_eph_type(eph).value
+        status.source = get_log_eph_source(eph).value
+        ephemeris_statuses.append(status)
     return ephemeris_statuses
 
 
@@ -177,32 +178,17 @@ class Laikad:
 
       return position_estimate, position_std, velocity_estimate, velocity_std
 
-  def gps_time_from_qcom_report(self, gnss_msg):
-    report = gnss_msg.drMeasurementReport
-    if report.source == log.QcomGnss.MeasurementSource.gps:
-      report_time = GPSTime(report.gpsWeek, report.gpsMilliseconds / 1000.0)
-    elif report.source == log.QcomGnss.MeasurementSource.sbas:
-      report_time = GPSTime(report.gpsWeek, report.gpsMilliseconds / 1000.0)
-    elif report.source == log.QcomGnss.MeasurementSource.glonass:
-      report_time = GPSTime.from_glonass(report.glonassYear,
-                                            report.glonassDay,
-                                            report.glonassMilliseconds / 1000.0)
-    else:
-      raise NotImplementedError(f'Unknownconstellation {report.source}')
-    return report_time
-
   def is_good_report(self, gnss_msg):
     if gnss_msg.which() == 'drMeasurementReport' and self.use_qcom:
+      constellation_id = ConstellationId.from_qcom_source(gnss_msg.drMeasurementReport.source)
       # TODO: Understand and use remaining unknown constellations
       try:
-        constellation_id = ConstellationId.from_qcom_source(gnss_msg.drMeasurementReport.source)
-        good_constellation = constellation_id in [ConstellationId.GPS, ConstellationId.SBAS, ConstellationId.GLONASS]
-        report_time = self.gps_time_from_qcom_report(gnss_msg)
+        good_constellation = constellation_id in [ConstellationId.GPS, ConstellationId.SBAS]
       except NotImplementedError:
-        return False
-      # Garbage timestamps with week > 32767 are sometimes sent by module.
-      # This is an issue with gpsTime and GLONASS time.
-      good_week = report_time.week < np.iinfo(np.int16).max
+        good_constellation = False
+      # gpsWeek 65535 is received rarely from quectel, this cannot be
+      # passed to GnssMeasurements's gpsWeek (Int16)
+      good_week = not getattr(gnss_msg, gnss_msg.which()).gpsWeek > np.iinfo(np.int16).max
       return good_constellation and good_week
     elif gnss_msg.which() == 'measurementReport' and not self.use_qcom:
       return True
@@ -211,26 +197,17 @@ class Laikad:
 
   def read_report(self, gnss_msg):
     if self.use_qcom:
-      # QCOM reports are per constellation, should always send 3 reports
       report = gnss_msg.drMeasurementReport
-      report_time = self.gps_time_from_qcom_report(gnss_msg)
-
-      if report_time - self.last_report_time > 0:
-        self.qcom_reports = [report]
-      else:
-        self.qcom_reports.append(report)
-      self.last_report_time = report_time
-
-      new_meas = []
-      if len(self.qcom_reports) == 3:
-        for report in self.qcom_reports:
-          new_meas.extend(read_raw_qcom(report))
-
+      week = report.gpsWeek
+      tow = report.gpsMilliseconds / 1000.0
+      new_meas = read_raw_qcom(report)
     else:
       report = gnss_msg.measurementReport
-      self.last_report_time = GPSTime(report.gpsWeek, report.rcvTow)
+      week = report.gpsWeek
+      tow = report.rcvTow
       new_meas = read_raw_ublox(report)
-    return self.last_report_time, new_meas
+    self.last_report_time = GPSTime(week, tow)
+    return week, tow, new_meas
 
   def is_ephemeris(self, gnss_msg):
     if self.use_qcom:
@@ -243,28 +220,16 @@ class Laikad:
       # TODO this is not robust to gps week rollover
       if self.gps_week is None:
         return
-      try:
-        ephem = parse_qcom_ephem(gnss_msg.drSvPoly, self.gps_week)
-        self.astro_dog.add_qcom_polys({ephem.prn: [ephem]})
-      except Exception:
-        cloudlog.exception("Error parsing qcom svPoly ephemeris from qcom module")
-        return
+      ephem = parse_qcom_ephem(gnss_msg.drSvPoly, self.gps_week)
+      self.astro_dog.add_qcom_polys({ephem.prn: [ephem]})
 
     else:
       if gnss_msg.which() == 'ephemeris':
         data_struct = ephemeris_structs.Ephemeris.new_message(**gnss_msg.ephemeris.to_dict())
-        try:
-          ephem = GPSEphemeris(data_struct, file_name='ublox')
-        except Exception:
-          cloudlog.exception("Error parsing GPS ephemeris from ublox")
-          return
+        ephem = GPSEphemeris(data_struct, file_name='ublox')
       elif gnss_msg.which() == 'glonassEphemeris':
         data_struct = ephemeris_structs.GlonassEphemeris.new_message(**gnss_msg.glonassEphemeris.to_dict())
-        try:
-          ephem = GLONASSEphemeris(data_struct, file_name='ublox')
-        except Exception:
-          cloudlog.exception("Error parsing GLONASS ephemeris from ublox")
-          return
+        ephem = GLONASSEphemeris(data_struct, file_name='ublox')
       else:
         cloudlog.error(f"Unsupported ephemeris type: {gnss_msg.which()}")
         return
@@ -277,11 +242,9 @@ class Laikad:
     processed_measurements = process_measurements(new_meas, self.astro_dog)
     if self.last_fix_pos is not None:
       est_pos = self.last_fix_pos
-      correct_delay = True
     else:
       est_pos = self.gnss_kf.x[GStates.ECEF_POS].tolist()
-      correct_delay = False
-    corrected_measurements = correct_measurements(processed_measurements, est_pos, self.astro_dog, correct_delay=correct_delay)
+    corrected_measurements = correct_measurements(processed_measurements, est_pos, self.astro_dog)
     return corrected_measurements
 
   def calc_fix(self, t, measurements):
@@ -304,11 +267,13 @@ class Laikad:
     if self.is_ephemeris(gnss_msg):
       self.read_ephemeris(gnss_msg)
     elif self.is_good_report(gnss_msg):
-      report_t, new_meas = self.read_report(gnss_msg)
-      self.gps_week = report_t.week
-      if report_t.week > 0:
+      week, tow, new_meas = self.read_report(gnss_msg)
+      self.gps_week = week
+      if week > 0:
+        self.got_first_gnss_msg = True
+        latest_msg_t = GPSTime(week, tow)
         if self.auto_fetch_navs:
-          self.fetch_navs(report_t, block)
+          self.fetch_navs(latest_msg_t, block)
 
       corrected_measurements = self.process_report(new_meas, t)
       msg_dict['correctedMeasurements'] = [create_measurement_msg(m) for m in corrected_measurements]
@@ -453,21 +418,33 @@ def main(sm=None, pm=None):
     raw_name = "qcomGnss"
   else:
     raw_name = "ubloxGnss"
-  raw_gnss_sock = messaging.sub_sock(raw_name, conflate=False)
+  raw_gnss_sock = messaging.sub_sock(raw_name, conflate=False, timeout=1000)
+
+  if sm is None:
+    sm = messaging.SubMaster(['clocks',])
   if pm is None:
     pm = messaging.PubMaster(['gnssMeasurements'])
 
   # disable until set as main gps source, to better analyze startup time
-  # TODO ensure low CPU usage before enabling
   use_internet = False  # "LAIKAD_NO_INTERNET" not in os.environ
 
   replay = "REPLAY" in os.environ
+  if replay or "CI" in os.environ:
+    use_internet = True
+
   laikad = Laikad(save_ephemeris=not replay, auto_fetch_navs=use_internet, use_qcom=use_qcom)
 
   while True:
-    for in_msg in messaging.drain_sock(raw_gnss_sock, wait_for_one=True):
+    for in_msg in messaging.drain_sock(raw_gnss_sock):
       out_msg = laikad.process_gnss_msg(getattr(in_msg, raw_name), in_msg.logMonoTime, replay)
       pm.send('gnssMeasurements', out_msg)
+
+    sm.update(0)
+    if not laikad.got_first_gnss_msg and sm.updated['clocks']:
+      clocks_msg = sm['clocks']
+      t = GPSTime.from_datetime(datetime.utcfromtimestamp(clocks_msg.wallTimeNanos * 1E-9))
+      if laikad.auto_fetch_navs:
+        laikad.fetch_navs(t, block=replay)
 
 
 if __name__ == "__main__":

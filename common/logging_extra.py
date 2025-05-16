@@ -153,9 +153,9 @@ class SwagLogger(logging.Logger):
   def bind_global(self, **kwargs):
     self.global_ctx.update(kwargs)
 
-  def event(self, event, *args, **kwargs):
+  def event(self, event_name, *args, **kwargs):
     evt = NiceOrderedDict()
-    evt['event'] = event
+    evt['event'] = event_name
     if args:
       evt['args'] = args
     evt.update(kwargs)

@@ -1,10 +1,11 @@
 import math
 
-from cereal import car, log
+from cereal import car
 from common.conversions import Conversions as CV
 from common.numpy_fast import clip, interp
 from common.realtime import DT_MDL
 from selfdrive.modeld.constants import T_IDXS
+from system.hardware import TICI
 
 # WARNING: this value was determined based on the model's training distribution,
 #          model predictions above this speed can be unpredictable
@@ -12,8 +13,8 @@ from selfdrive.modeld.constants import T_IDXS
 V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
-V_CRUISE_INITIAL = 40
-V_CRUISE_INITIAL_EXPERIMENTAL_MODE = 105
+V_CRUISE_INITIAL = 32
+V_CRUISE_INITIAL_EXPERIMENTAL_MODE = V_CRUISE_INITIAL if not TICI else 105
 IMPERIAL_INCREMENT = 1.6  # should be CV.MPH_TO_KPH, but this causes rounding errors
 
 MIN_SPEED = 1.0
@@ -26,8 +27,6 @@ LON_MPC_N = 32
 
 # EU guidelines
 MAX_LATERAL_JERK = 5.0
-
-MAX_VEL_ERR = 5.0
 
 ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
@@ -81,11 +80,12 @@ class VCruiseHelper:
         self.v_cruise_cluster_kph = self.v_cruise_kph
         self.update_button_timers(CS, enabled)
       else:
-        if enabled and dp_override_speed and CS.cruiseState.speed * CV.MS_TO_KPH < dp_override_speed:
-          if self.dp_override_v_cruise_kph == V_CRUISE_UNSET:
-            self.dp_override_v_cruise_kph = max(CS.vEgo * CV.MS_TO_KPH, V_CRUISE_MIN)
-        else:
-          self.dp_override_v_cruise_kph = V_CRUISE_UNSET
+        if dp_override_speed:
+          if enabled and not self.dp_override_enabled_last:
+            if CS.cruiseState.speed * CV.MS_TO_KPH < dp_override_speed:
+              self.dp_override_v_cruise_kph = clip(CS.vEgo * CV.MS_TO_KPH, V_CRUISE_MIN, V_CRUISE_MAX)
+            else:
+              self.dp_override_v_cruise_kph = V_CRUISE_UNSET
 
         # when we have an override_speed, use it
         if self.dp_override_v_cruise_kph != V_CRUISE_UNSET:
@@ -177,7 +177,6 @@ class VCruiseHelper:
       self.v_cruise_kph = int(round(clip(CS.vEgo * CV.MS_TO_KPH, initial, V_CRUISE_MAX)))
 
     self.v_cruise_cluster_kph = self.v_cruise_kph
-
 
 def apply_deadzone(error, deadzone):
   if error > deadzone:
@@ -293,25 +292,6 @@ def get_0816_lag_adjusted_curvature(CP, v_ego, psis, curvatures, curvature_rates
 
   return safe_desired_curvature, safe_desired_curvature_rate
 
-
-def get_friction(lateral_accel_error: float, lateral_accel_deadzone: float, friction_threshold: float, torque_params: car.CarParams.LateralTorqueTuning, friction_compensation: bool) -> float:
-  friction_interp = interp(
-    apply_center_deadzone(lateral_accel_error, lateral_accel_deadzone),
-    [-friction_threshold, friction_threshold],
-    [-torque_params.friction, torque_params.friction]
-  )
-  friction = float(friction_interp) if friction_compensation else 0.0
-  return friction
-
-
-def get_speed_error(modelV2: log.ModelDataV2, v_ego: float) -> float:
-  # ToDo: Try relative error, and absolute speed
-  if len(modelV2.temporalPose.trans):
-    vel_err = clip(modelV2.temporalPose.trans[0] - v_ego, -MAX_VEL_ERR, MAX_VEL_ERR)
-    return float(vel_err)
-  return 0.0
-
-  
 def get_lane_laneless_mode(lll_prob, rll_prob, mode):
   if lll_prob < 0.3 and rll_prob < 0.3:
     mode = False

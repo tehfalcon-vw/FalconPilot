@@ -11,6 +11,7 @@ from common.realtime import Ratekeeper, Priority, config_realtime_process
 from selfdrive.controls.lib.radar_helpers import Cluster, Track, RADAR_TO_CAMERA
 from system.swaglog import cloudlog
 from third_party.cluster.fastcluster_py import cluster_points_centroid
+from system.hardware import TICI
 
 
 class KalmanParams():
@@ -64,7 +65,7 @@ def match_vision_to_cluster(v_ego, lead, clusters):
     return None
 
 
-def get_lead(v_ego, ready, clusters, lead_msg, model_v_ego, low_speed_override=True):
+def get_lead(v_ego, ready, clusters, lead_msg, lead_index, low_speed_override=True):
   # Determine leads, this is where the essential logic happens
   if len(clusters) > 0 and ready and lead_msg.prob > .5:
     cluster = match_vision_to_cluster(v_ego, lead_msg, clusters)
@@ -75,7 +76,7 @@ def get_lead(v_ego, ready, clusters, lead_msg, model_v_ego, low_speed_override=T
   if cluster is not None:
     lead_dict = cluster.get_RadarState(lead_msg.prob)
   elif (cluster is None) and ready and (lead_msg.prob > .5):
-    lead_dict = Cluster().get_RadarState_from_vision(lead_msg, v_ego, model_v_ego)
+    lead_dict = Cluster().get_RadarState_from_vision(lead_msg, lead_index, v_ego)
 
   if low_speed_override:
     low_speed_clusters = [c for c in clusters if c.potential_low_speed_lead(v_ego)]
@@ -168,20 +169,16 @@ class RadarD():
     radarState.radarErrors = list(rr.errors)
     radarState.carStateMonoTime = sm.logMonoTime['carState']
 
-    if len(sm['modelV2'].temporalPose.trans):
-      model_v_ego = sm['modelV2'].temporalPose.trans[0]
-    else:
-      model_v_ego = self.v_ego
     leads_v3 = sm['modelV2'].leadsV3
     if len(leads_v3) > 1:
-      radarState.leadOne = get_lead(self.v_ego, self.ready, clusters, leads_v3[0], model_v_ego, low_speed_override=True)
-      radarState.leadTwo = get_lead(self.v_ego, self.ready, clusters, leads_v3[1], model_v_ego, low_speed_override=False)
+      radarState.leadOne = get_lead(self.v_ego, self.ready, clusters, leads_v3[0], 0, low_speed_override=True)
+      radarState.leadTwo = get_lead(self.v_ego, self.ready, clusters, leads_v3[1], 1, low_speed_override=False)
     return dat
 
 
 # fuses camera and radar data for best lead detection
 def radard_thread(sm=None, pm=None, can_sock=None):
-  config_realtime_process(5, Priority.CTRL_LOW)
+  config_realtime_process(5 if TICI else 2, Priority.CTRL_LOW)
 
   # wait for stats about the car to come in from controls
   cloudlog.info("radard is waiting for CarParams")

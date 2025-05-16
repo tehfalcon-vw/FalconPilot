@@ -8,13 +8,13 @@ from selfdrive.controls.lib.lane_planner import LanePlanner, TRAJECTORY_SIZE
 from selfdrive.controls.lib.desire_helper import DesireHelper
 import cereal.messaging as messaging
 from cereal import log
-from selfdrive.hardware import TICI
+from system.hardware import TICI
 from common.params import Params
 
 
 class LateralPlanner:
   def __init__(self, CP):
-    self.LP = LanePlanner()
+    self.LP = LanePlanner(False if not TICI else Params().get_bool('WideCameraOnly'))
     self.DH = DesireHelper()
 
     # Vehicle model parameters used to calculate lateral movement of car
@@ -50,7 +50,7 @@ class LateralPlanner:
       self.dp_lanelines_enable = sm['dragonConf'].dpLateralLanelines
       self.dp_camera_offset = sm['dragonConf'].dpLateralCameraOffset
       self.dp_path_offset = sm['dragonConf'].dpLateralPathOffset
-      if sm['dragonConf'].dpLateralAltLanelines and sm['controlsState'].dpLateralAltActive:
+      if sm['controlsState'].dpLateralAltActive and sm['dragonConf'].dpLateralAltLanelines:
         self.dp_lanelines_enable = True
         self.dp_camera_offset = sm['dragonConf'].dpLateralAltCameraOffset
         self.dp_path_offset = sm['dragonConf'].dpLateralAltPathOffset

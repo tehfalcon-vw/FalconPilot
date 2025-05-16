@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 import numpy as np
 from cereal import car
 from common.params import Params
@@ -9,6 +8,7 @@ from selfdrive.modeld.constants import T_IDXS
 from selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from selfdrive.controls.lib.lateral_planner import LateralPlanner
 import cereal.messaging as messaging
+from system.hardware import TICI
 
 from selfdrive.dragonpilot.controls_0813.lib.lateral_planner import LateralPlanner as DPLateralPlanner
 from selfdrive.dragonpilot.controls_0816.lib.lateral_planner import LateralPlanner as FPLateralPlanner
@@ -31,14 +31,12 @@ def publish_ui_plan(sm, pm, lateral_planner, longitudinal_planner):
   pm.send('uiPlan', ui_send)
 
 def plannerd_thread(sm=None, pm=None):
-  config_realtime_process(5, Priority.CTRL_LOW)
+  config_realtime_process(5 if TICI else 2, Priority.CTRL_LOW)
 
   cloudlog.info("plannerd is waiting for CarParams")
   params = Params()
   CP = car.CarParams.from_bytes(params.get("CarParams", block=True))
   cloudlog.info("plannerd got CarParams: %s", CP.carName)
-
-  debug_mode = bool(int(os.getenv("DEBUG", "0")))
 
   longitudinal_planner = LongitudinalPlanner(CP)
   try:
@@ -52,10 +50,10 @@ def plannerd_thread(sm=None, pm=None):
   elif lat_version == 2: # 0816
     lateral_planner = FPLateralPlanner(CP)
   else:
-    lateral_planner = LateralPlanner(CP, debug=debug_mode)
+    lateral_planner = LateralPlanner(CP)
 
   if sm is None:
-    sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'dragonConf', 'lateralPlan', 'liveMapData'],
+    sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'dragonConf', 'lateralPlan', 'navInstruction', 'liveMapData'],
                              poll=['radarState', 'modelV2'], ignore_avg_freq=['radarState'])
 
   if pm is None:
@@ -69,8 +67,8 @@ def plannerd_thread(sm=None, pm=None):
       lateral_planner.publish(sm, pm)
       longitudinal_planner.update(sm)
       longitudinal_planner.publish(sm, pm)
-      if lat_version == 0:
-        publish_ui_plan(sm, pm, lateral_planner, longitudinal_planner)
+      # if lat_version == 0:
+      #   publish_ui_plan(sm, pm, lateral_planner, longitudinal_planner)
 
 def main(sm=None, pm=None):
   plannerd_thread(sm, pm)

@@ -6,8 +6,12 @@ export NUMEXPR_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 
+if [ -z "$NEOS_VERSION" ]; then
+  export NEOS_VERSION="20"
+fi
+
 if [ -z "$AGNOS_VERSION" ]; then
-  export AGNOS_VERSION="7.1"
+  export AGNOS_VERSION="6.2"
 fi
 
 if [ -z "$PASSIVE" ]; then

@@ -3,7 +3,7 @@ from cereal import log
 from common.filter_simple import FirstOrderFilter
 from common.numpy_fast import interp
 from common.realtime import DT_MDL
-from selfdrive.hardware import TICI#, EON
+from system.hardware import TICI, EON
 from system.swaglog import cloudlog
 
 
@@ -11,12 +11,19 @@ TRAJECTORY_SIZE = 33
 # camera offset is meters from center car to camera
 # model path is in the frame of EON's camera. TICI is 0.1 m away,
 # however the average measured path difference is 0.04 m
-PATH_OFFSET = 0.00
-CAMERA_OFFSET = 0.04
+if TICI:
+  CAMERA_OFFSET = 0.04
+  PATH_OFFSET = 0.04
+elif EON:
+  CAMERA_OFFSET = -0.06
+  PATH_OFFSET = 0.0
+else:
+  CAMERA_OFFSET = 0.0
+  PATH_OFFSET = 0.0
 
 
 class LanePlanner:
-  def __init__(self):
+  def __init__(self, wide_camera=False):
     self.ll_t = np.zeros((TRAJECTORY_SIZE,))
     self.ll_x = np.zeros((TRAJECTORY_SIZE,))
     self.lll_y = np.zeros((TRAJECTORY_SIZE,))
@@ -35,11 +42,12 @@ class LanePlanner:
     self.l_lane_change_prob = 0.
     self.r_lane_change_prob = 0.
 
-    self.camera_offset = -CAMERA_OFFSET
-    self.path_offset = -PATH_OFFSET
+    self.camera_offset = -CAMERA_OFFSET if wide_camera else CAMERA_OFFSET
+    self.path_offset = -PATH_OFFSET if wide_camera else PATH_OFFSET
 
     self.dp_camera_offset = None
     self.dp_path_offset = None
+    self.dp_wide_camera = wide_camera
 
   def update_dp_camera_offsets(self, camera_offset, path_offset):
     if self.dp_camera_offset != camera_offset:
@@ -47,13 +55,13 @@ class LanePlanner:
       camera_offset = -camera_offset
       # from 0.04 to -0.04, difference is -0.08
       # so we can assume the distance between C3's 2 cameras is 8 cm
-      self.camera_offset = camera_offset * 0.01
+      self.camera_offset = (camera_offset - 8) * 0.01 if self.dp_wide_camera else camera_offset * 0.01
     if self.dp_path_offset != path_offset:
       self.dp_path_offset = path_offset
       path_offset = -path_offset
       # from 0.04 to -0.04, difference is -0.08
       # so we can assume the distance between C3's 2 cameras is 8 cm
-      self.path_offset = path_offset * 0.01
+      self.path_offset = (path_offset - 8) * 0.01 if self.dp_wide_camera else path_offset * 0.01
 
   def parse_model(self, md):
     lane_lines = md.laneLines

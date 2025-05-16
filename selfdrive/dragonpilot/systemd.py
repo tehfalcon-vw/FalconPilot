@@ -30,13 +30,13 @@ import cereal.messaging as messaging
 from common.dp_conf import confs, get_struct_name, to_struct_val
 from common.params import Params, put_bool_nonblocking
 import os
-#from selfdrive.hardware import HARDWARE
 params = Params()
 from common.dp_helpers import get_last_modified, LAST_MODIFIED_TIMER_SYSTEMD
+from selfdrive.dragonpilot.dashcamd import Dashcamd
 import socket
-from common.realtime import Ratekeeper, config_realtime_process
+from common.realtime import Ratekeeper
 import threading
-#from selfdrive.dragonpilot.gpx_uploader import gpx_uploader_thread
+from selfdrive.dragonpilot.gpx_uploader import gpx_uploader_thread
 from typing import Dict, Any
 import capnp
 
@@ -47,7 +47,6 @@ HERTZ = 1
 last_modified_confs: Dict[str, Any] = {}
 
 def confd_thread():
-  config_realtime_process([2], 5)
   sm = messaging.SubMaster(['deviceState'])
   pm = messaging.PubMaster(['dragonConf'])
 
@@ -58,18 +57,17 @@ def confd_thread():
   last_modified = None
   last_modified_check = None
   started = False
-  # free_space = 1
+  free_space = 1.
   last_started = False
-  # dashcamd = Dashcamd()
-  # is_eon = EON
+  dashcamd = Dashcamd()
   rk = Ratekeeper(HERTZ, print_delay_threshold=None)  # Keeps rate at 2 hz
-  #uploader_thread = None
+  uploader_thread = None
   dp_jetson = params.get_bool('dp_jetson')
 
   while True:
-    #if uploader_thread is None:
-    #  uploader_thread = threading.Thread(target=gpx_uploader_thread)
-    #  uploader_thread.start()
+    if uploader_thread is None:
+      uploader_thread = threading.Thread(target=gpx_uploader_thread)
+      uploader_thread.start()
 
     msg = messaging.new_message('dragonConf')
     if last_dp_msg is not None:
@@ -80,19 +78,19 @@ def confd_thread():
     load thermalState data every 3 seconds
     ===================================================
     '''
-    # if frame % (HERTZ * 3) == 0:
-    #   sm.update(0)
-    #   if sm.updated['deviceState']:
-    #     started = sm['deviceState'].started
-    #     free_space = sm['deviceState'].freeSpacePercent
+    if frame % (HERTZ * 3) == 0:
+      sm.update(0)
+      if sm.updated['deviceState']:
+        started = sm['deviceState'].started
+        free_space = sm['deviceState'].freeSpacePercent
     '''
     ===================================================
     hotspot on boot
     we do it after 30 secs just in case
     ===================================================
     '''
-    # if is_eon and frame == (HERTZ * 30) and param_get("dp_hotspot_on_boot", "bool", False):
-    #   os.system("service call wifi 37 i32 0 i32 1 &")
+    if frame == (HERTZ * 30) and params.get_bool("dp_hotspot_on_boot"):
+      os.system("service call wifi 37 i32 0 i32 1 &")
     '''
     ===================================================
     check dp_last_modified every second
@@ -158,8 +156,8 @@ def confd_thread():
     dashcam
     ===================================================
     '''
-    # if msg.dragonConf.dpDashcamd and frame % HERTZ == 0:
-    #   dashcamd.run(started, free_space)
+    if msg.dragonConf.dpDashcamd and frame % HERTZ == 0:
+      dashcamd.run(started, free_space)
     '''
     ===================================================
     finalise

@@ -27,7 +27,7 @@ from common.params import Params
 from system.version import get_version
 
 # for uploader
-from system.loggerd.xattr_cache import getxattr, setxattr
+from selfdrive.loggerd.xattr_cache import getxattr, setxattr
 import glob
 import requests
 import json
@@ -56,9 +56,7 @@ def _debug(msg):
 class GpxUploader():
   def __init__(self):
     self._delete_after_upload = not Params().get_bool('dp_gpxd')
-    self._car_model = "Unknown Vehicle"
-
-  def _identify_vehicle(self):
+    self._car_model = "Unknown Model"
     # read model from LiveParameters
     params = Params().get("LiveParameters")
     if params is not None:
@@ -77,9 +75,8 @@ class GpxUploader():
       return False
 
   def _get_is_uploaded(self, filename):
-    result = getxattr(filename, UPLOAD_ATTR_NAME) is not None
-    _debug("%s is uploaded: %s" % (filename, result))
-    return result
+    _debug("%s is uploaded: %s" % (filename, getxattr(filename, UPLOAD_ATTR_NAME) is not None))
+    return getxattr(filename, UPLOAD_ATTR_NAME) is not None
 
   def _set_is_uploaded(self, filename):
     _debug("%s set to uploaded" % filename)
@@ -113,18 +110,10 @@ class GpxUploader():
       return False
 
   def run(self):
-    # give it few seconds before we start runing the process
-    # only identify vehicle once
-    time.sleep(10)
-    self._identify_vehicle()
     while True:
-      is_offroad = Params().get_bool("IsOffroad")
       files = self._get_files_to_be_uploaded()
       if len(files) == 0:
-        if is_offroad and self._delete_after_upload:
-          for file in self._get_files():
-            os.remove(file)
-        _debug("run - no files, clean stash")
+        _debug("run - no files")
       elif not self._is_online() and self._delete_after_upload:
         _debug("run - not online & delete_after_upload")
         for file in files:
@@ -138,7 +127,9 @@ class GpxUploader():
             else:
               _debug("run - set_is_uploaded")
               self._set_is_uploaded(file)
-      time.sleep(60)
+      # sleep for 300 secs if offroad
+      # otherwise sleep 60 secs
+      time.sleep(300 if Params().get_bool("IsOffroad") else 60)
 
 def gpx_uploader_thread():
   gpx_uploader = GpxUploader()

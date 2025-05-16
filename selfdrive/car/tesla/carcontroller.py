@@ -24,18 +24,17 @@ class CarController:
     hands_on_fault = CS.steer_warning == "EAC_ERROR_HANDS_ON" and CS.hands_on_level >= 3
     lkas_enabled = CC.latActive and not hands_on_fault
 
-    if self.frame % 2 == 0:
-      if lkas_enabled:
-        # Angular rate limit based on speed
-        apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgo, CarControllerParams)
+    if lkas_enabled:
+      # Angular rate limit based on speed
+      apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgo, CarControllerParams)
 
-        # To not fault the EPS
-        apply_angle = clip(apply_angle, CS.out.steeringAngleDeg - 20, CS.out.steeringAngleDeg + 20)
-      else:
-        apply_angle = CS.out.steeringAngleDeg
+      # To not fault the EPS
+      apply_angle = clip(apply_angle, CS.out.steeringAngleDeg - 20, CS.out.steeringAngleDeg + 20)
+    else:
+      apply_angle = CS.out.steeringAngleDeg
 
-      self.apply_angle_last = apply_angle
-      can_sends.append(self.tesla_can.create_steering_control(apply_angle, lkas_enabled, (self.frame // 2) % 16))
+    self.apply_angle_last = apply_angle
+    can_sends.append(self.tesla_can.create_steering_control(apply_angle, lkas_enabled, self.frame))
 
     # Longitudinal control (in sync with stock message, about 40Hz)
     if self.CP.openpilotLongitudinalControl:
@@ -60,7 +59,7 @@ class CarController:
     # TODO: HUD control
 
     new_actuators = actuators.copy()
-    new_actuators.steeringAngleDeg = self.apply_angle_last
+    new_actuators.steeringAngleDeg = apply_angle
 
     self.frame += 1
     return new_actuators, can_sends
